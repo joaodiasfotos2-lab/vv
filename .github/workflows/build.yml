@@ -1,0 +1,177 @@
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      plataformas:
+        description: "Que sistemas compilar?"
+        type: choice
+        default: windows
+        options: [windows, mac, linux, todos]
+
+jobs:
+  plano:
+    name: Escolher sistemas
+    runs-on: ubuntu-latest
+    outputs:
+      matriz: ${{ steps.m.outputs.matriz }}
+    steps:
+      - id: m
+        shell: bash
+        run: |
+          P="${{ github.event.inputs.plataformas || 'windows' }}"
+          W='{"nome":"Windows","os":"windows-latest","args":""}'
+          M1='{"nome":"macOS Apple Silicon","os":"macos-latest","args":"--target aarch64-apple-darwin"}'
+          M2='{"nome":"macOS Intel","os":"macos-latest","args":"--target x86_64-apple-darwin"}'
+          L='{"nome":"Linux","os":"ubuntu-22.04","args":""}'
+          case "$P" in
+            windows) S="$W" ;;
+            mac) S="$M1,$M2" ;;
+            linux) S="$L" ;;
+            *) S="$W,$M1,$M2,$L" ;;
+          esac
+          echo "matriz={\"include\":[$S]}" >> "$GITHUB_OUTPUT"
+
+  compilar:
+    needs: plano
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plano.outputs.matriz) }}
+    name: ${{ matrix.nome }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Extrair o jogo.zip e localizar o projeto
+        shell: bash
+        run: |
+          if [ ! -f jogo.zip ]; then echo "::error::Falta o ficheiro jogo.zip na raiz do repositório (carrega-o em Add file > Upload files)."; exit 1; fi
+          python -c "import zipfile; zipfile.ZipFile('jogo.zip').extractall('app')"
+          PROJ=$(python -c "import glob,os; c=sorted(glob.glob('app/**/src-tauri/tauri.conf.json', recursive=True)); print(os.path.dirname(os.path.dirname(c[0])).replace(chr(92),'/') if c else '')")
+          if [ -z "$PROJ" ]; then echo "::error::O jogo.zip não contém o projeto (falta src-tauri/tauri.conf.json)."; find app -maxdepth 2 | head -30; exit 1; fi
+          echo "Projeto em: $PROJ"
+          echo "PROJ=$PROJ" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache do Rust
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: "${{ env.PROJ }}/src-tauri -> target"
+
+      - name: Dependências Linux
+        if: matrix.os == 'ubuntu-22.04'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libssl-dev libgtk-3-dev
+
+      - name: Instalar dependências JS
+        shell: bash
+        working-directory: ${{ env.PROJ }}
+        run: npm install
+
+      - name: Compilar
+        uses: tauri-apps/tauri-action@v0
+        with:
+          projectPath: ${{ env.PROJ }}
+          args: ${{ matrix.args }}
+
+      - name: Guardar instalador como ficheiro descarregável
+        uses: actions/upload-artifact@v4
+        with:
+          name: instalador-${{ matrix.nome }}
+          path: |
+            ${{ env.PROJ }}/src-tauri/target/**/bundle/**/*.msi
+            ${{ env.PROJ }}/src-tauri/target/**/bundle/**/*.exe
+            ${{ env.PROJ }}/src-tauri/target/**/bundle/**/*.dmg
+            ${{ env.PROJ }}/src-tauri/target/**/bundle/**/*.deb
+            ${{ env.PROJ }}/src-tauri/target/**/bundle/**/*.AppImage
+          if-no-files-found: error
+
+      # Versão portátil (Windows): o .exe do Tauri já leva o jogo dentro, por isso não precisa de instalação nem
+      # de direitos de administrador — basta extrair a pasta e abrir o .exe. (Só precisa do WebView2, que já vem
+      # com o Windows 11 e com o Windows 10 atualizado.)
+      - name: Montar a versão portátil (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          EXE="$PROJ/src-tauri/target/release/hoquei-manager-2027.exe"
+          if [ ! -f "$EXE" ]; then echo "::error::Não encontrei o .exe compilado."; ls "$PROJ/src-tauri/target/release" | head -30; exit 1; fi
+          mkdir -p "portatil/Hoquei Manager 2027"
+          cp "$EXE" "portatil/Hoquei Manager 2027/Hoquei Manager 2027.exe"
+          cat > "portatil/Hoquei Manager 2027/LEIA-ME.txt" <<'TXT'
+          HÓQUEI MANAGER 2027 — versão portátil (Windows)
+
+          1. Extrai esta pasta para onde quiseres (Ambiente de trabalho, Documentos, uma pen USB...).
+             Não a abras de dentro do ZIP: clica com o botão direito no ZIP > Extrair tudo.
+          2. Abre "Hoquei Manager 2027.exe". Não precisa de instalação nem de direitos de administrador.
+          3. Se o Windows mostrar "O Windows protegeu o seu PC" (SmartScreen): clica em "Mais informações" e depois
+             em "Executar mesmo assim". Aparece porque o programa ainda não tem assinatura digital paga.
+             Também não precisa de administrador.
+
+          As gravações ficam em: Documentos\Hoquei Manager 2027\Saves (podes copiá-las para outro computador).
+          Para desinstalar basta apagar a pasta do jogo (e, se quiseres, as definições em
+          %LOCALAPPDATA%\pt.placer.hoqueimanager2027).
+
+          Se o programa abrir uma janela em branco ou não abrir, falta o "Microsoft Edge WebView2 Runtime"
+          (já vem com o Windows 11 e com o Windows 10 atualizado). Descarrega-o em
+          https://developer.microsoft.com/microsoft-edge/webview2/ (Evergreen Standalone Installer).
+          TXT
+
+      - name: Guardar a versão portátil como ficheiro descarregável
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: portatil-Windows
+          path: portatil
+          if-no-files-found: error
+
+      # Versão portátil (macOS): a app (.app) já leva o jogo dentro. Não precisa de instalação: descompacta o ZIP,
+      # arrasta a app para onde quiseres e abre-a. Usa-se "ditto" para o ZIP manter as permissões da app.
+      - name: Montar a versão portátil (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          APP=$(find "$PROJ/src-tauri/target" -type d -name "*.app" -path "*bundle/macos*" | head -1)
+          if [ -z "$APP" ]; then echo "::error::Não encontrei a app (.app) compilada."; find "$PROJ/src-tauri/target" -maxdepth 6 -name "*.app" | head; exit 1; fi
+          case "${{ matrix.nome }}" in *Silicon*) ARQ="Apple-Silicon" ;; *) ARQ="Intel" ;; esac
+          mkdir -p portatil-mac
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "portatil-mac/Hoquei Manager 2027 (Mac $ARQ).zip"
+          cat > portatil-mac/LEIA-ME.txt <<'TXT'
+          HÓQUEI MANAGER 2027 — versão portátil (Mac)
+
+          1. Descompacta o ZIP que corresponde ao teu Mac (duplo clique no ZIP):
+             - "Apple-Silicon" para Macs com chip M1, M2, M3, M4...
+             - "Intel" para Macs mais antigos com processador Intel.
+             (Menu  > Acerca deste Mac mostra qual é.)
+          2. Arrasta "Hoquei Manager 2027.app" para onde quiseres (Ambiente de trabalho, Documentos, pen USB...).
+             Não precisa de instalação nem de palavra-passe de administrador.
+          3. Na primeira vez, o macOS pode dizer que a app "não pode ser aberta" porque ainda não tem assinatura
+             paga da Apple. Resolve assim (só uma vez):
+             - Clica na app com o botão direito (ou Ctrl + clique) > "Abrir" > "Abrir"; ou
+             - Definições do Sistema > Privacidade e Segurança > descer até "Abrir mesmo assim"; ou
+             - No Terminal: xattr -dr com.apple.quarantine "/caminho/para/Hoquei Manager 2027.app"
+
+          As gravações ficam em: Documentos/Hoquei Manager 2027/Saves (podes copiá-las para outro Mac).
+          Para desinstalar basta apagar a app.
+          TXT
+
+      - name: Guardar a versão portátil como ficheiro descarregável (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/upload-artifact@v4
+        with:
+          name: portatil-${{ matrix.nome }}
+          path: portatil-mac
+          if-no-files-found: error
